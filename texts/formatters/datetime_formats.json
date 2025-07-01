@@ -1,0 +1,9 @@
+{
+    "timestamp_formats": {
+        "not_set": "Не указано",
+        "invalid": "Неверный формат даты",
+        "default": "%d.%m.%Y %H:%M:%S",
+        "date_only": "%d.%m.%Y",
+        "time_only": "%H:%M"
+    }
+}

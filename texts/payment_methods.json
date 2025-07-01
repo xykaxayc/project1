@@ -1,0 +1,12 @@
+[
+    {
+        "id": "qiwi",
+        "name": "QIWI",
+        "details": "@your_qiwi_nick"
+    },
+    {
+        "id": "card",
+        "name": "Банковская карта",
+        "details": "0000 0000 0000 0000"
+    }
+]

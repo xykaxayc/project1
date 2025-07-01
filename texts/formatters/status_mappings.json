@@ -1,0 +1,34 @@
+{
+    "user_status": {
+        "active": {
+            "emoji": "✅",
+            "text": "Активна",
+            "color": "green"
+        },
+        "expired": {
+            "emoji": "❌",
+            "text": "Истекла",
+            "color": "red"
+        },
+        "limited": {
+            "emoji": "⚠️",
+            "text": "Ограничена",
+            "color": "yellow"
+        },
+        "disabled": {
+            "emoji": "🚫",
+            "text": "Отключена",
+            "color": "gray"
+        },
+        "pending": {
+            "emoji": "⏳",
+            "text": "Ожидает",
+            "color": "blue"
+        },
+        "unknown": {
+            "emoji": "❓",
+            "text": "Неизвестно",
+            "color": "gray"
+        }
+    }
+}

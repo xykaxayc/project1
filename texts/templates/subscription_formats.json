@@ -1,0 +1,54 @@
+{
+    "formats": [
+        {
+            "name": "standard_sub",
+            "url": "{base_url}/sub/{username}",
+            "description": "Стандартный формат /sub/"
+        },
+        {
+            "name": "sub_with_token",
+            "url": "{base_url}/sub/{username}?token={token}",
+            "description": "Формат с токеном"
+        },
+        {
+            "name": "subscription_path",
+            "url": "{base_url}/subscription/{username}",
+            "description": "Формат /subscription/"
+        },
+        {
+            "name": "api_subscription",
+            "url": "{base_url}/api/subscription/{username}",
+            "description": "API формат /api/subscription/"
+        },
+        {
+            "name": "api_sub",
+            "url": "{base_url}/api/sub/{username}",
+            "description": "API формат /api/sub/"
+        },
+        {
+            "name": "user_subscription",
+            "url": "{base_url}/user/{username}/subscription",
+            "description": "Формат /user/username/subscription"
+        },
+        {
+            "name": "subs_path",
+            "url": "{base_url}/subs/{username}",
+            "description": "Формат /subs/"
+        },
+        {
+            "name": "client_subscription",
+            "url": "{base_url}/client/{username}",
+            "description": "Клиентский формат"
+        },
+        {
+            "name": "v2ray_subscription",
+            "url": "{base_url}/v2ray/{username}",
+            "description": "V2Ray формат"
+        },
+        {
+            "name": "xray_subscription",
+            "url": "{base_url}/xray/{username}",
+            "description": "XRay формат"
+        }
+    ]
+}
