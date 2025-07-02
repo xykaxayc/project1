@@ -1,124 +1,561 @@
 import sqlite3
+import logging
 from datetime import datetime
-from telegram import Update
-from telegram.ext import ContextTypes
+from typing import Optional, Dict, List
 
-from .base_handler import BaseHandler
-from utils.formatters import format_user_info_message, format_statistics_message, format_pending_payments_message
-from texts import get_text
+logger = logging.getLogger(__name__)
 
-class AdminHandlers(BaseHandler):
-    """Обработчики административных команд"""
+class DatabaseManager:
+    def __init__(self, db_path: str = "users_database.db"):
+        self.db_path = db_path
+        self.init_database()
     
-    def _get_user_id(self, update):
-        is_callback = hasattr(update, 'callback_query') and update.callback_query is not None
-        return update.callback_query.from_user.id if is_callback else update.effective_user.id
-
-    async def admin_links_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Команда для генерации ссылок (только для админов)"""
-        if not await self.require_admin(update):
-            return
-        
-        unlinked_users = self.db.get_unlinked_users()
-        
-        if not unlinked_users:
-            await update.message.reply_text(get_text("admin.ALL_USERS_LINKED"))
-            return
-        
-        bot_username = context.bot.username
-        
-        await update.message.reply_text(get_text("admin.LINKS_HEADER"))
-        
-        for username in unlinked_users:
-            invite_code = f"link_{username}_{hash(username) % 10000:04d}"
-            link = f"https://t.me/{bot_username}?start={invite_code}"
-            
-            message = get_text("admin.LINK_USER", username=username, link=link)
-            
-            try:
-                await update.message.reply_text(message)
-            except Exception as e:
-                self.logger.error(get_text("admin.LINK_SEND_ERROR", username=username, error=e))
-        
-        await update.message.reply_text(
-            get_text("admin.LINKS_SUMMARY", count=len(unlinked_users))
-        )
-    
-    async def stats_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Команда статистики (для админов)"""
-        if not await self.require_admin(update):
-            return
-        
-        stats = self.db.get_statistics()
-        message = format_statistics_message(stats)
-        
-        await update.message.reply_text(message, parse_mode='Markdown')
-    
-    async def user_info_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Команда получения информации о пользователе (для админов)"""
-        if not await self.require_admin(update):
-            return
-        
-        if not context.args:
-            await update.message.reply_text(get_text("admin.USER_INFO_USAGE"), parse_mode='Markdown')
-            return
-        
-        username = context.args[0]
-        
-        # Получаем информацию из базы данных
-        db_user = self.db.get_user_by_marzban_username(username)
-        if not db_user:
-            await update.message.reply_text(get_text("admin.USER_NOT_FOUND", username=username))
-            return
-        
-        # Получаем информацию из Marzban
-        stats = self.marzban.get_user_usage_stats(username)
-        
-        message = format_user_info_message(db_user, stats, self.marzban)
-        
-        # История платежей
-        payments = self.db.get_payment_history(marzban_username=username, limit=5)
-        
-        def esc(text):
-            if not text:
-                return '-'
-            return str(text).replace('_', '\\_').replace('*', '\\*').replace('[', '\\[').replace('`', '\\`').replace('(', '\\(').replace(')', '\\)').replace('~', '\\~').replace('>', '\\>').replace('#', '\\#').replace('+', '\\+').replace('-', '\\-').replace('=', '\\=').replace('|', '\\|').replace('{', '\\{').replace('}', '\\}').replace('.', '\\.').replace('!', '\\!')
-        
-        if payments:
-            message += f"\n{get_text('admin.LAST_PAYMENTS_HEADER')}\n"
-            for payment in payments:
-                dt = datetime.fromisoformat(payment['payment_date'])
-                date = esc(dt.strftime('%d.%m.%Y'))
-                time = esc(dt.strftime('%H:%M'))
-                amount = esc(payment['amount'])
-                status = esc(payment['status'])
-                message += f"• {date} {time}: {amount} руб. \\({status}\\)\n"
-
-        await update.message.reply_text(message, parse_mode='MarkdownV2')
-    
-    async def pending_payments_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Команда просмотра ожидающих заявок"""
-        if not await self.require_admin(update):
-            return
-        
-        requests = self.db.get_pending_payment_requests()
-        
-        if not requests:
-            await update.message.reply_text("✅ Нет ожидающих заявок на оплату.")
-            return
-        
-        message = format_pending_payments_message(requests)
-        await update.message.reply_text(message)
-    
-    async def new_users_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Команда просмотра новых зарегистрированных пользователей"""
-        if not await self.require_admin(update):
-            return
-        
-        # Получаем пользователей зарегистрированных за последние 24 часа
-        conn = sqlite3.connect(self.db.db_path)
+    def init_database(self):
+        """Инициализация базы данных и создание таблиц"""
+        conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
+        # Таблица для связи пользователей Marzban с Telegram
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS user_telegram_mapping (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                marzban_username TEXT UNIQUE NOT NULL,
+                telegram_id INTEGER UNIQUE,
+                telegram_username TEXT,
+                phone_number TEXT,
+                registration_date DATETIME DEFAULT CURRENT_TIMESTAMP,
+                is_verified BOOLEAN DEFAULT FALSE,
+                subscription_status TEXT DEFAULT 'active',
+                notes TEXT
+            )
+        ''')
+        
+        # Таблица для истории платежей
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS payment_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id INTEGER NOT NULL,
+                marzban_username TEXT NOT NULL,
+                amount DECIMAL(10,2),
+                payment_date DATETIME DEFAULT CURRENT_TIMESTAMP,
+                payment_method TEXT,
+                transaction_id TEXT,
+                status TEXT DEFAULT 'pending'
+            )
+        ''')
+
+        # Таблица для заявок на оплату
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS payment_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id INTEGER NOT NULL,
+                marzban_username TEXT NOT NULL,
+                plan_id TEXT NOT NULL,
+                amount DECIMAL(10,2) NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                status TEXT DEFAULT 'pending',
+                receipt_file_id TEXT,
+                receipt_type TEXT,
+                admin_comment TEXT,
+                processed_at DATETIME,
+                processed_by INTEGER
+            )
+        ''')
+        
+        # Таблица для настроек бота
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS bot_settings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                setting_key TEXT UNIQUE NOT NULL,
+                setting_value TEXT,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        conn.commit()
+        conn.close()
+        logger.info("База данных инициализирована")
+    
+    def add_user(self, marzban_username: str, subscription_status: str = 'active', notes: str = None) -> bool:
+        """Добавление нового пользователя"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        try:
+            cursor.execute('''
+                INSERT OR IGNORE INTO user_telegram_mapping 
+                (marzban_username, subscription_status, notes) 
+                VALUES (?, ?, ?)
+            ''', (marzban_username, subscription_status, notes))
+            
+            success = cursor.rowcount > 0
+            conn.commit()
+            return success
+            
+        except sqlite3.Error as e:
+            logger.error(f"Ошибка добавления пользователя {marzban_username}: {e}")
+            return False
+        finally:
+            conn.close()
+    
+    def create_payment_request(self, telegram_id: int, marzban_username: str, plan_id: str, amount: float) -> int:
+        """Создание заявки на оплату"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        try:
+            cursor.execute('''
+                INSERT INTO payment_requests 
+                (telegram_id, marzban_username, plan_id, amount)
+                VALUES (?, ?, ?, ?)
+            ''', (telegram_id, marzban_username, plan_id, amount))
+            
+            request_id = cursor.lastrowid
+            conn.commit()
+            
+            logger.info(f"Создана заявка на оплату #{request_id} для {marzban_username}")
+            return request_id
+            
+        except sqlite3.Error as e:
+            logger.error(f"Ошибка создания заявки на оплату: {e}")
+            return 0
+        finally:
+            conn.close()
+    
+    def add_receipt_to_request(self, request_id: int, file_id: str, file_type: str) -> bool:
+        """Добавление чека к заявке на оплату"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        try:
+            cursor.execute('''
+                UPDATE payment_requests 
+                SET receipt_file_id = ?, receipt_type = ?
+                WHERE id = ?
+            ''', (file_id, file_type, request_id))
+            
+            success = cursor.rowcount > 0
+            conn.commit()
+            
+            if success:
+                logger.info(f"Чек добавлен к заявке #{request_id}")
+            
+            return success
+            
+        except sqlite3.Error as e:
+            logger.error(f"Ошибка добавления чека: {e}")
+            return False
+        finally:
+            conn.close()
+    
+    def get_pending_payment_requests(self) -> List[Dict]:
+        """Получение ожидающих обработки заявок"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT id, telegram_id, marzban_username, plan_id, amount, 
+                   created_at, receipt_file_id, receipt_type
+            FROM payment_requests 
+            WHERE status = 'pending'
+            ORDER BY created_at DESC
+        ''')
+        
+        requests = []
+        for row in cursor.fetchall():
+            requests.append({
+                'id': row[0],
+                'telegram_id': row[1],
+                'marzban_username': row[2],
+                'plan_id': row[3],
+                'amount': row[4],
+                'created_at': row[5],
+                'receipt_file_id': row[6],
+                'receipt_type': row[7]
+            })
+        
+        conn.close()
+        return requests
+    
+    def approve_payment_request(self, request_id: int, admin_id: int, comment: str = None) -> bool:
+        """Одобрение заявки на оплату"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        try:
+            cursor.execute('''
+                UPDATE payment_requests 
+                SET status = 'approved', processed_at = CURRENT_TIMESTAMP, 
+                    processed_by = ?, admin_comment = ?
+                WHERE id = ? AND status = 'pending'
+            ''', (admin_id, comment, request_id))
+            
+            success = cursor.rowcount > 0
+            conn.commit()
+            
+            if success:
+                logger.info(f"Заявка #{request_id} одобрена админом {admin_id}")
+            
+            return success
+            
+        except sqlite3.Error as e:
+            logger.error(f"Ошибка одобрения заявки: {e}")
+            return False
+        finally:
+            conn.close()
+    
+    def reject_payment_request(self, request_id: int, admin_id: int, comment: str) -> bool:
+        """Отклонение заявки на оплату"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        try:
+            cursor.execute('''
+                UPDATE payment_requests 
+                SET status = 'rejected', processed_at = CURRENT_TIMESTAMP, 
+                    processed_by = ?, admin_comment = ?
+                WHERE id = ? AND status = 'pending'
+            ''', (admin_id, comment, request_id))
+            
+            success = cursor.rowcount > 0
+            conn.commit()
+            
+            if success:
+                logger.info(f"Заявка #{request_id} отклонена админом {admin_id}")
+            
+            return success
+            
+        except sqlite3.Error as e:
+            logger.error(f"Ошибка отклонения заявки: {e}")
+            return False
+        finally:
+            conn.close()
+    
+    def get_payment_request(self, request_id: int) -> Optional[Dict]:
+        """Получение заявки по ID"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT id, telegram_id, marzban_username, plan_id, amount, 
+                   created_at, status, receipt_file_id, receipt_type
+            FROM payment_requests 
+            WHERE id = ?
+        ''', (request_id,))
+        
+        row = cursor.fetchone()
+        conn.close()
+        
+        if row:
+            return {
+                'id': row[0],
+                'telegram_id': row[1],
+                'marzban_username': row[2],
+                'plan_id': row[3],
+                'amount': row[4],
+                'created_at': row[5],
+                'status': row[6],
+                'receipt_file_id': row[7],
+                'receipt_type': row[8]
+            }
+        return None
+    
+    def create_new_user_record(self, username: str, telegram_id: int, telegram_username: str = None) -> bool:
+        """Создание записи для нового зарегистрированного пользователя"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        try:
+            note_parts = [f"Telegram ID: {telegram_id}"]
+            if telegram_username:
+                note_parts.append(f"@{telegram_username}")
+            note_parts.append("Зарегистрирован через бота")
+            notes = " | ".join(note_parts)
+            
+            cursor.execute('''
+                INSERT INTO user_telegram_mapping 
+                (marzban_username, telegram_id, telegram_username, is_verified, 
+                 subscription_status, notes) 
+                VALUES (?, ?, ?, TRUE, 'active', ?)
+            ''', (username, telegram_id, telegram_username, notes))
+            
+            success = cursor.rowcount > 0
+            conn.commit()
+            
+            if success:
+                logger.info(f"Запись для нового пользователя {username} создана")
+            
+            return success
+            
+        except sqlite3.Error as e:
+            logger.error(f"Ошибка создания записи пользователя: {e}")
+            return False
+        finally:
+            conn.close()
+
+    def get_users_by_telegram_id(self, telegram_id: int) -> List[Dict]:
+        """Получение всех аккаунтов пользователя по Telegram ID"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT marzban_username, telegram_id, telegram_username, 
+                   subscription_status, registration_date, is_verified, notes
+            FROM user_telegram_mapping 
+            WHERE telegram_id = ?
+        ''', (telegram_id,))
+        rows = cursor.fetchall()
+        conn.close()
+        result = []
+        for row in rows:
+            result.append({
+                'marzban_username': row[0],
+                'telegram_id': row[1],
+                'telegram_username': row[2],
+                'subscription_status': row[3],
+                'registration_date': row[4],
+                'is_verified': bool(row[5]),
+                'notes': row[6]
+            })
+        return result
+    
+    def add_telegram_id_to_notes(self, marzban_username: str, telegram_id: int) -> bool:
+        """Добавление Telegram ID в примечания пользователя"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        try:
+            cursor.execute(
+                "SELECT notes FROM user_telegram_mapping WHERE marzban_username = ?",
+                (marzban_username,)
+            )
+            result = cursor.fetchone()
+            
+            if not result:
+                return False
+            
+            current_notes = result[0] or ""
+            
+            if f"Telegram ID: {telegram_id}" in current_notes:
+                logger.info(f"Telegram ID {telegram_id} уже есть в примечаниях для {marzban_username}")
+                return True
+            
+            new_notes = f"{current_notes} | Telegram ID: {telegram_id}" if current_notes else f"Telegram ID: {telegram_id}"
+            
+            cursor.execute('''
+                UPDATE user_telegram_mapping 
+                SET notes = ?
+                WHERE marzban_username = ?
+            ''', (new_notes, marzban_username))
+            
+            success = cursor.rowcount > 0
+            conn.commit()
+            
+            if success:
+                logger.info(f"Telegram ID {telegram_id} добавлен в примечания для {marzban_username}")
+            
+            return success
+            
+        except sqlite3.Error as e:
+            logger.error(f"Ошибка обновления примечаний: {e}")
+            return False
+        finally:
+            conn.close()
+    
+    def update_user_notes(self, marzban_username: str, notes: str) -> bool:
+        """Обновление примечаний пользователя"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        try:
+            cursor.execute('''
+                UPDATE user_telegram_mapping 
+                SET notes = ?
+                WHERE marzban_username = ?
+            ''', (notes, marzban_username))
+            
+            success = cursor.rowcount > 0
+            conn.commit()
+            return success
+            
+        except sqlite3.Error as e:
+            logger.error(f"Ошибка обновления примечаний: {e}")
+            return False
+        finally:
+            conn.close()
+    
+    def get_user_by_telegram_id(self, telegram_id: int) -> Optional[Dict]:
+        """Получение пользователя по Telegram ID"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT marzban_username, telegram_id, telegram_username, 
+                   subscription_status, registration_date, is_verified, notes
+            FROM user_telegram_mapping 
+            WHERE telegram_id = ?
+        ''', (telegram_id,))
+        
+        row = cursor.fetchone()
+        conn.close()
+        
+        if row:
+            return {
+                'marzban_username': row[0],
+                'telegram_id': row[1],
+                'telegram_username': row[2],
+                'subscription_status': row[3],
+                'registration_date': row[4],
+                'is_verified': bool(row[5]),
+                'notes': row[6]
+            }
+        return None
+    
+    def get_user_by_marzban_username(self, marzban_username: str) -> Optional[Dict]:
+        """Получение пользователя по имени в Marzban"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT marzban_username, telegram_id, telegram_username, 
+                   subscription_status, registration_date, is_verified, notes
+            FROM user_telegram_mapping 
+            WHERE marzban_username = ?
+        ''', (marzban_username,))
+        
+        row = cursor.fetchone()
+        conn.close()
+        
+        if row:
+            return {
+                'marzban_username': row[0],
+                'telegram_id': row[1],
+                'telegram_username': row[2],
+                'subscription_status': row[3],
+                'registration_date': row[4],
+                'is_verified': bool(row[5]),
+                'notes': row[6]
+            }
+        return None
+    
+    def link_telegram_account(self, marzban_username: str, telegram_id: int, 
+                             telegram_username: str = None, phone_number: str = None) -> bool:
+        """Связывание аккаунта Marzban с Telegram"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        try:
+            note_parts = [f"Telegram ID: {telegram_id}"]
+            if telegram_username:
+                note_parts.append(f"@{telegram_username}")
+            note_parts.append("Связан через бота")
+            notes = " | ".join(note_parts)
+            
+            cursor.execute('''
+                UPDATE user_telegram_mapping 
+                SET telegram_id = ?, telegram_username = ?, phone_number = ?, 
+                    is_verified = TRUE, notes = ?
+                WHERE marzban_username = ? AND telegram_id IS NULL
+            ''', (telegram_id, telegram_username, phone_number, notes, marzban_username))
+            
+            success = cursor.rowcount > 0
+            conn.commit()
+            
+            if success:
+                logger.info(f"Пользователь {marzban_username} связан с Telegram ID {telegram_id}")
+            
+            return success
+            
+        except sqlite3.Error as e:
+            logger.error(f"Ошибка связывания аккаунта: {e}")
+            return False
+        finally:
+            conn.close()
+    
+    def get_unlinked_users(self) -> List[str]:
+        """Получение списка пользователей без связанного Telegram ID"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT marzban_username FROM user_telegram_mapping 
+            WHERE telegram_id IS NULL
+        ''')
+        
+        users = [row[0] for row in cursor.fetchall()]
+        conn.close()
+        return users
+    
+    def record_payment(self, telegram_id: int, marzban_username: str, amount: float, 
+                      payment_method: str, transaction_id: str = None, status: str = 'completed') -> bool:
+        """Запись платежа в историю"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        try:
+            if not transaction_id:
+                transaction_id = f"manual_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            
+            cursor.execute('''
+                INSERT INTO payment_history 
+                (telegram_id, marzban_username, amount, payment_method, transaction_id, status)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (telegram_id, marzban_username, amount, payment_method, transaction_id, status))
+            
+            conn.commit()
+            logger.info(f"Платеж записан: {marzban_username} - {amount} руб.")
+            return True
+            
+        except sqlite3.Error as e:
+            logger.error(f"Ошибка записи платежа: {e}")
+            return False
+        finally:
+            conn.close()
+    
+    def get_payment_history(self, telegram_id: int = None, marzban_username: str = None, 
+                           limit: int = 10) -> List[Dict]:
+        """Получение истории платежей"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        query = '''
+            SELECT telegram_id, marzban_username, amount, payment_date, 
+                   payment_method, transaction_id, status
+            FROM payment_history 
+        '''
+        params = []
+        
+        if telegram_id:
+            query += 'WHERE telegram_id = ? '
+            params.append(telegram_id)
+        elif marzban_username:
+            query += 'WHERE marzban_username = ? '
+            params.append(marzban_username)
+        
+        query += 'ORDER BY payment_date DESC LIMIT ?'
+        params.append(limit)
+        
+        cursor.execute(query, tuple(params))
+        
+        payments = []
+        for row in cursor.fetchall():
+            payments.append({
+                'telegram_id': row[0],
+                'marzban_username': row[1],
+                'amount': row[2],
+                'payment_date': row[3],
+                'payment_method': row[4],
+                'transaction_id': row[5],
+                'status': row[6]
+            })
+        
+        conn.close()
+        return payments
+    
+    # ДОБАВЛЕНО: Новый метод для инкапсуляции запроса
+    def get_new_users_last_24h(self) -> List[Dict]:
+        """Получение новых пользователей, зарегистрированных за последние 24 часа."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
         cursor.execute('''
             SELECT marzban_username, telegram_id, telegram_username, registration_date, notes
             FROM user_telegram_mapping 
@@ -126,248 +563,102 @@ class AdminHandlers(BaseHandler):
             AND notes LIKE '%Зарегистрирован через бота%'
             ORDER BY registration_date DESC
         ''')
-        
-        new_users = cursor.fetchall()
+        users = []
+        for row in cursor.fetchall():
+            users.append({
+                'marzban_username': row[0],
+                'telegram_id': row[1],
+                'telegram_username': row[2],
+                'registration_date': row[3],
+                'notes': row[4]
+            })
         conn.close()
-        
-        if not new_users:
-            await update.message.reply_text("📊 За последние 24 часа новых регистраций не было.")
-            return
-        
-        message = f"🆕 НОВЫЕ РЕГИСТРАЦИИ (24ч): {len(new_users)}\n\n"
-        
-        for user in new_users:
-            username, telegram_id, telegram_username, reg_date, notes = user
-            reg_time = datetime.fromisoformat(reg_date).strftime('%d.%m %H:%M')
-            
-            message += f"👤 {username}\n"
-            message += f"📱 @{telegram_username or 'N/A'} (ID: {telegram_id})\n"
-            message += f"🕐 {reg_time}\n"
-            message += f"/user_info {username}\n\n"
-        
-        # Разбиваем на части если сообщение слишком длинное
-        if len(message) > 4000:
-            parts = [message[i:i+4000] for i in range(0, len(message), 4000)]
-            for part in parts:
-                await update.message.reply_text(part)
-        else:
-            await update.message.reply_text(message)
-    
-    async def add_telegram_note_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Команда добавления Telegram ID в примечания пользователя (для админов)"""
-        if not await self.require_admin(update):
-            return
-        
-        if len(context.args) != 2:
-            await update.message.reply_text(
-                "Использование: `/add_note username telegram_id`\n\n"
-                "Пример: `/add_note Dasha 123456789`",
-                parse_mode='Markdown'
-            )
-            return
-        
-        username = context.args[0]
-        try:
-            telegram_id = int(context.args[1])
-        except ValueError:
-            await update.message.reply_text("❌ Telegram ID должен быть числом.")
-            return
-        
-        # Проверяем, существует ли пользователь
-        user = self.db.get_user_by_marzban_username(username)
-        if not user:
-            await update.message.reply_text(f"❌ Пользователь {username} не найден в базе данных.")
-            return
-        
-        # Обновляем примечания
-        success = self.db.add_telegram_id_to_notes(username, telegram_id)
-        
-        if success:
-            await update.message.reply_text(
-                f"✅ Telegram ID {telegram_id} добавлен в примечания пользователя {username}"
-            )
-        else:
-            await update.message.reply_text(
-                f"❌ Ошибка добавления Telegram ID в примечания для {username}"
-            )
-    
-    async def sync_telegram_notes_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Синхронизация примечаний с Telegram ID для всех связанных пользователей"""
-        if not await self.require_admin(update):
-            return
-        
-        await update.message.reply_text("🔄 Начинаю синхронизацию примечаний...")
-        
-        # Получаем всех пользователей с Telegram ID
-        conn = sqlite3.connect(self.db.db_path)
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            SELECT marzban_username, telegram_id, telegram_username, notes
-            FROM user_telegram_mapping 
-            WHERE telegram_id IS NOT NULL
-        ''')
-        
-        users = cursor.fetchall()
-        conn.close()
-        
-        updated_count = 0
-        for user_data in users:
-            username, telegram_id, telegram_username, current_notes = user_data
-            
-            # Проверяем, есть ли уже Telegram ID в примечаниях
-            if current_notes and f"Telegram ID: {telegram_id}" in current_notes:
-                continue
-            
-            # Формируем новые примечания
-            note_parts = [f"Telegram ID: {telegram_id}"]
-            if telegram_username:
-                note_parts.append(f"@{telegram_username}")
-            
-            if current_notes:
-                new_notes = f"{current_notes} | {' | '.join(note_parts)}"
-            else:
-                new_notes = " | ".join(note_parts)
-            
-            # Обновляем примечания
-            if self.db.update_user_notes(username, new_notes):
-                updated_count += 1
-        
-        await update.message.reply_text(
-            f"✅ Синхронизация завершена!\n"
-            f"Обновлено примечаний: {updated_count}\n"
-            f"Всего пользователей с Telegram: {len(users)}"
-        )
-    
-    async def sync_to_marzban_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Синхронизация всех Telegram ID в примечания Marzban"""
-        if not await self.require_admin(update):
-            return
-        
-        await update.message.reply_text("🔄 Синхронизация Telegram ID в Marzban...")
-        
-        # Получаем всех связанных пользователей
-        conn = sqlite3.connect(self.db.db_path)
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            SELECT marzban_username, telegram_id, telegram_username
-            FROM user_telegram_mapping 
-            WHERE telegram_id IS NOT NULL AND is_verified = TRUE
-        ''')
-        
-        users = cursor.fetchall()
-        conn.close()
-        
-        success_count = 0
-        error_count = 0
-        
-        for marzban_username, telegram_id, telegram_username in users:
-            success = self.marzban.sync_telegram_id_to_marzban_notes(
-                marzban_username, telegram_id, telegram_username
-            )
-            
-            if success:
-                success_count += 1
-                self.logger.info(f"✅ Синхронизирован {marzban_username} -> Telegram ID {telegram_id}")
-            else:
-                error_count += 1
-                self.logger.error(f"❌ Ошибка синхронизации {marzban_username}")
-        
-        await update.message.reply_text(
-            f"✅ Синхронизация с Marzban завершена!\n\n"
-            f"✅ Успешно: {success_count}\n"
-            f"❌ Ошибки: {error_count}\n"
-            f"📊 Всего: {len(users)}\n\n"
-            f"Теперь в панели Marzban в поле 'Примечание' будут Telegram ID пользователей."
-        )
-    
-    async def test_marzban_note_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Тестирование добавления примечания в Marzban для одного пользователя"""
-        if not await self.require_admin(update):
-            return
-        
-        if len(context.args) != 1:
-            await update.message.reply_text(
-                "Использование: `/test_note username`\n\n"
-                "Пример: `/test_note Andrey_Ios`",
-                parse_mode='Markdown'
-            )
-            return
-        
-        username = context.args[0]
-        
-        # Получаем данные пользователя из БД
-        user = self.db.get_user_by_marzban_username(username)
-        if not user or not user['telegram_id']:
-            await update.message.reply_text(f"❌ Пользователь {username} не найден или не связан с Telegram")
-            return
-        
-        await update.message.reply_text(f"🔄 Тестируем добавление примечания для {username}...")
-        
-        # Добавляем примечание
-        success = self.marzban.sync_telegram_id_to_marzban_notes(
-            username, user['telegram_id'], user['telegram_username']
-        )
-        
-        if success:
-            await update.message.reply_text(
-                f"✅ Примечание успешно добавлено для {username}\n"
-                f"Telegram ID: {user['telegram_id']}\n"
-                f"Проверьте в админ панели Marzban!"
-            )
-        else:
-            await update.message.reply_text(
-                f"❌ Ошибка добавления примечания для {username}\n"
-                "Проверьте логи для детальной информации."
-            )
+        return users
 
-    async def admin_panel_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Отображение админ панели"""
-        if not await self.require_admin(update):
-            return
-            
-        text = "👑 Админ-панель"
-        keyboard = self.create_admin_keyboard()
+    def get_statistics(self) -> Dict:
+        """Получение статистики базы данных"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
         
-        await update.message.reply_text(text, reply_markup=keyboard)
+        stats = {}
+        
+        cursor.execute("SELECT COUNT(*) FROM user_telegram_mapping")
+        stats['total_users'] = cursor.fetchone()[0]
+        
+        cursor.execute("SELECT COUNT(*) FROM user_telegram_mapping WHERE telegram_id IS NOT NULL")
+        stats['linked_users'] = cursor.fetchone()[0]
+        
+        cursor.execute("SELECT COUNT(*) FROM payment_requests WHERE status = 'pending'")
+        stats['pending_payments'] = cursor.fetchone()[0]
+
+        cursor.execute("SELECT COUNT(*) FROM payment_requests WHERE status = 'approved' AND date(processed_at) = date('now')")
+        stats['approved_today'] = cursor.fetchone()[0]
+        
+        cursor.execute("SELECT SUM(amount) FROM payment_history WHERE status = 'completed' AND datetime(payment_date) >= datetime('now', '-30 days')")
+        stats['monthly_revenue'] = cursor.fetchone()[0] or 0
+        
+        conn.close()
+        return stats
     
-    async def delete_user_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Удалить пользователя по username (только для администратора)"""
-        if not self.config.is_admin(update.effective_user.id):
-            await update.message.reply_text("❌ У вас нет прав для выполнения этой команды.")
-            return
-        if not context.args or len(context.args) < 1:
-            await update.message.reply_text("Укажите username для удаления: /delete_user <username>")
-            return
-        username = context.args[0]
-        deleted = self.db.delete_user_by_username(username)
-        if deleted:
-            await update.message.reply_text(f"✅ Пользователь {username} удалён из базы данных.")
-        else:
-            await update.message.reply_text(f"❌ Пользователь {username} не найден.")
+    def update_user_status(self, marzban_username: str, status: str) -> bool:
+        """Обновление статуса пользователя"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        try:
+            cursor.execute('''
+                UPDATE user_telegram_mapping 
+                SET subscription_status = ?
+                WHERE marzban_username = ?
+            ''', (status, marzban_username))
+            
+            success = cursor.rowcount > 0
+            conn.commit()
+            return success
+            
+        except sqlite3.Error as e:
+            logger.error(f"Ошибка обновления статуса пользователя: {e}")
+            return False
+        finally:
+            conn.close()
     
-    async def cleanup_accounts_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Удаляет из базы пользователей, которых нет на сервере Marzban"""
-        if not self.config.is_admin(update.effective_user.id):
-            await update.message.reply_text("❌ Нет прав администратора.")
-            return
-        users = self.db.get_all_users()
-        removed = []
-        for user in users:
-            username = user.get('marzban_username')
-            if not username:
-                continue
-            try:
-                marzban_user = self.marzban.get_user(username)
-                if not marzban_user:
-                    self.db.delete_user_by_username(username)
-                    removed.append(username)
-            except Exception as e:
-                if '404' in str(e):
-                    self.db.delete_user_by_username(username)
-                    removed.append(username)
-        if removed:
-            await update.message.reply_text(f"Удалены несуществующие аккаунты: {', '.join(removed)}")
-        else:
-            await update.message.reply_text("Все аккаунты в базе существуют на сервере Marzban.")
+    def get_setting(self, key: str) -> Optional[str]:
+        """Получение настройки бота"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute("SELECT setting_value FROM bot_settings WHERE setting_key = ?", (key,))
+        result = cursor.fetchone()
+        conn.close()
+        
+        return result[0] if result else None
+    
+    def set_setting(self, key: str, value: str) -> bool:
+        """Установка настройки бота"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        try:
+            cursor.execute('''
+                INSERT OR REPLACE INTO bot_settings (setting_key, setting_value, updated_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+            ''', (key, value))
+            
+            conn.commit()
+            return True
+            
+        except sqlite3.Error as e:
+            logger.error(f"Ошибка сохранения настройки: {e}")
+            return False
+        finally:
+            conn.close()
+    
+    def delete_user_by_username(self, marzban_username: str) -> bool:
+        """Удалить пользователя по marzban_username"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM user_telegram_mapping WHERE marzban_username = ?", (marzban_username,))
+        deleted = cursor.rowcount > 0
+        conn.commit()
+        conn.close()
+        return deleted

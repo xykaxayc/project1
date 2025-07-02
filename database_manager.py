@@ -43,6 +43,24 @@ class DatabaseManager:
                 status TEXT DEFAULT 'pending'
             )
         ''')
+
+        # Таблица для заявок на оплату
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS payment_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id INTEGER NOT NULL,
+                marzban_username TEXT NOT NULL,
+                plan_id TEXT NOT NULL,
+                amount DECIMAL(10,2) NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                status TEXT DEFAULT 'pending',
+                receipt_file_id TEXT,
+                receipt_type TEXT,
+                admin_comment TEXT,
+                processed_at DATETIME,
+                processed_by INTEGER
+            )
+        ''')
         
         # Таблица для настроек бота
         cursor.execute('''
@@ -86,24 +104,6 @@ class DatabaseManager:
         cursor = conn.cursor()
         
         try:
-            # Создаем таблицу для заявок на оплату если её нет
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS payment_requests (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    telegram_id INTEGER NOT NULL,
-                    marzban_username TEXT NOT NULL,
-                    plan_id TEXT NOT NULL,
-                    amount DECIMAL(10,2) NOT NULL,
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    status TEXT DEFAULT 'pending',
-                    receipt_file_id TEXT,
-                    receipt_type TEXT,
-                    admin_comment TEXT,
-                    processed_at DATETIME,
-                    processed_by INTEGER
-                )
-            ''')
-            
             cursor.execute('''
                 INSERT INTO payment_requests 
                 (telegram_id, marzban_username, plan_id, amount)
@@ -148,7 +148,7 @@ class DatabaseManager:
         finally:
             conn.close()
     
-    def get_pending_payment_requests(self):
+    def get_pending_payment_requests(self) -> List[Dict]:
         """Получение ожидающих обработки заявок"""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
@@ -231,7 +231,7 @@ class DatabaseManager:
         finally:
             conn.close()
     
-    def get_payment_request(self, request_id: int):
+    def get_payment_request(self, request_id: int) -> Optional[Dict]:
         """Получение заявки по ID"""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
@@ -266,7 +266,6 @@ class DatabaseManager:
         cursor = conn.cursor()
         
         try:
-            # Формируем примечание для нового пользователя
             note_parts = [f"Telegram ID: {telegram_id}"]
             if telegram_username:
                 note_parts.append(f"@{telegram_username}")
@@ -293,34 +292,7 @@ class DatabaseManager:
             return False
         finally:
             conn.close()
-    
-    def get_users_by_telegram_id_partial(self, telegram_id: int):
-        """Получение всех пользователей (связанных и несвязанных) для конкретного Telegram ID"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            SELECT marzban_username, telegram_id, subscription_status, is_verified
-            FROM user_telegram_mapping 
-            WHERE telegram_id = ? OR telegram_id IS NULL
-        ''')
-        
-        results = cursor.fetchall()
-        conn.close()
-        
-        # Возвращаем связанные с этим telegram_id
-        linked_users = []
-        for row in results:
-            if row[1] == telegram_id:  # telegram_id совпадает
-                linked_users.append({
-                    'marzban_username': row[0],
-                    'telegram_id': row[1],
-                    'subscription_status': row[2],
-                    'is_verified': bool(row[3])
-                })
-        
-        return linked_users
-    
+
     def get_users_by_telegram_id(self, telegram_id: int) -> List[Dict]:
         """Получение всех аккаунтов пользователя по Telegram ID"""
         conn = sqlite3.connect(self.db_path)
@@ -352,7 +324,6 @@ class DatabaseManager:
         cursor = conn.cursor()
         
         try:
-            # Получаем текущие примечания
             cursor.execute(
                 "SELECT notes FROM user_telegram_mapping WHERE marzban_username = ?",
                 (marzban_username,)
@@ -364,16 +335,11 @@ class DatabaseManager:
             
             current_notes = result[0] or ""
             
-            # Проверяем, нет ли уже Telegram ID в примечаниях
             if f"Telegram ID: {telegram_id}" in current_notes:
                 logger.info(f"Telegram ID {telegram_id} уже есть в примечаниях для {marzban_username}")
                 return True
             
-            # Добавляем Telegram ID к существующим примечаниям
-            if current_notes:
-                new_notes = f"{current_notes} | Telegram ID: {telegram_id}"
-            else:
-                new_notes = f"Telegram ID: {telegram_id}"
+            new_notes = f"{current_notes} | Telegram ID: {telegram_id}" if current_notes else f"Telegram ID: {telegram_id}"
             
             cursor.execute('''
                 UPDATE user_telegram_mapping 
@@ -478,7 +444,6 @@ class DatabaseManager:
         cursor = conn.cursor()
         
         try:
-            # Формируем примечание с Telegram ID
             note_parts = [f"Telegram ID: {telegram_id}"]
             if telegram_username:
                 note_parts.append(f"@{telegram_username}")
@@ -552,32 +517,24 @@ class DatabaseManager:
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
+        query = '''
+            SELECT telegram_id, marzban_username, amount, payment_date, 
+                   payment_method, transaction_id, status
+            FROM payment_history 
+        '''
+        params = []
+        
         if telegram_id:
-            cursor.execute('''
-                SELECT telegram_id, marzban_username, amount, payment_date, 
-                       payment_method, transaction_id, status
-                FROM payment_history 
-                WHERE telegram_id = ?
-                ORDER BY payment_date DESC
-                LIMIT ?
-            ''', (telegram_id, limit))
+            query += 'WHERE telegram_id = ? '
+            params.append(telegram_id)
         elif marzban_username:
-            cursor.execute('''
-                SELECT telegram_id, marzban_username, amount, payment_date, 
-                       payment_method, transaction_id, status
-                FROM payment_history 
-                WHERE marzban_username = ?
-                ORDER BY payment_date DESC
-                LIMIT ?
-            ''', (marzban_username, limit))
-        else:
-            cursor.execute('''
-                SELECT telegram_id, marzban_username, amount, payment_date, 
-                       payment_method, transaction_id, status
-                FROM payment_history 
-                ORDER BY payment_date DESC
-                LIMIT ?
-            ''', (limit,))
+            query += 'WHERE marzban_username = ? '
+            params.append(marzban_username)
+        
+        query += 'ORDER BY payment_date DESC LIMIT ?'
+        params.append(limit)
+        
+        cursor.execute(query, tuple(params))
         
         payments = []
         for row in cursor.fetchall():
@@ -594,51 +551,54 @@ class DatabaseManager:
         conn.close()
         return payments
     
+    # ДОБАВЛЕНО: Новый метод для инкапсуляции запроса
+    def get_new_users_last_24h(self) -> List[Dict]:
+        """Получение новых пользователей, зарегистрированных за последние 24 часа."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT marzban_username, telegram_id, telegram_username, registration_date, notes
+            FROM user_telegram_mapping 
+            WHERE registration_date >= datetime('now', '-1 day')
+            AND notes LIKE '%Зарегистрирован через бота%'
+            ORDER BY registration_date DESC
+        ''')
+        users = []
+        for row in cursor.fetchall():
+            users.append({
+                'marzban_username': row[0],
+                'telegram_id': row[1],
+                'telegram_username': row[2],
+                'registration_date': row[3],
+                'notes': row[4]
+            })
+        conn.close()
+        return users
+
     def get_statistics(self) -> Dict:
         """Получение статистики базы данных"""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
-        # Статистика пользователей
+        stats = {}
+        
         cursor.execute("SELECT COUNT(*) FROM user_telegram_mapping")
-        total_users = cursor.fetchone()[0]
+        stats['total_users'] = cursor.fetchone()[0]
         
         cursor.execute("SELECT COUNT(*) FROM user_telegram_mapping WHERE telegram_id IS NOT NULL")
-        linked_users = cursor.fetchone()[0]
+        stats['linked_users'] = cursor.fetchone()[0]
         
-        cursor.execute("SELECT COUNT(*) FROM user_telegram_mapping WHERE is_verified = TRUE")
-        verified_users = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM payment_requests WHERE status = 'pending'")
+        stats['pending_payments'] = cursor.fetchone()[0]
+
+        cursor.execute("SELECT COUNT(*) FROM payment_requests WHERE status = 'approved' AND date(processed_at) = date('now')")
+        stats['approved_today'] = cursor.fetchone()[0]
         
-        # Статистика платежей
-        cursor.execute("SELECT COUNT(*), SUM(amount) FROM payment_history WHERE status = 'completed'")
-        payment_stats = cursor.fetchone()
-        total_payments = payment_stats[0] or 0
-        total_revenue = payment_stats[1] or 0
-        
-        # Платежи за последний месяц
-        cursor.execute('''
-            SELECT COUNT(*), SUM(amount) 
-            FROM payment_history 
-            WHERE status = 'completed' 
-            AND datetime(payment_date) >= datetime('now', '-30 days')
-        ''')
-        monthly_stats = cursor.fetchone()
-        monthly_payments = monthly_stats[0] or 0
-        monthly_revenue = monthly_stats[1] or 0
+        cursor.execute("SELECT SUM(amount) FROM payment_history WHERE status = 'completed' AND datetime(payment_date) >= datetime('now', '-30 days')")
+        stats['monthly_revenue'] = cursor.fetchone()[0] or 0
         
         conn.close()
-        
-        return {
-            'total_users': total_users,
-            'linked_users': linked_users,
-            'verified_users': verified_users,
-            'unlinked_users': total_users - linked_users,
-            'link_percentage': (linked_users / total_users * 100) if total_users > 0 else 0,
-            'total_payments': total_payments,
-            'total_revenue': total_revenue,
-            'monthly_payments': monthly_payments,
-            'monthly_revenue': monthly_revenue
-        }
+        return stats
     
     def update_user_status(self, marzban_username: str, status: str) -> bool:
         """Обновление статуса пользователя"""

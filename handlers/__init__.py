@@ -6,7 +6,7 @@ from .registration_handlers import RegistrationHandlers
 
 __all__ = [
     'UserHandlers',
-    'AdminHandlers', 
+    'AdminHandlers',
     'PaymentHandlers',
     'SubscriptionHandlers',
     'RegistrationHandlers'

@@ -12,8 +12,8 @@ class RegistrationHandlers(BaseHandler):
     
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # Исправленный путь для загрузки registration_messages.json
-        self.messages = get_json("texts/handlers/registration_messages.json")
+        # ИСПРАВЛЕНО: Используем правильный ключ для доступа к текстам
+        self.messages = get_json("handlers.registration_messages")
         import logging
         logging.getLogger(__name__).info(f"Loaded registration messages: {self.messages}")
     
@@ -31,7 +31,6 @@ class RegistrationHandlers(BaseHandler):
         reply_markup = InlineKeyboardMarkup([
             [InlineKeyboardButton("◀️ Назад", callback_data="main_menu")]
         ])
-        # Исправлена загрузка сообщения
         await query.edit_message_text(
             self.messages["registration_form"], 
             reply_markup=reply_markup
@@ -64,10 +63,6 @@ class RegistrationHandlers(BaseHandler):
         user_id = self._get_user_id(update)
         username = update.message.text.strip()
         
-        # Логируем состояние messages перед использованием account_creation
-        import logging
-        logging.getLogger(__name__).info(f"account_creation in messages: {self.messages.get('account_creation')}")
-        
         # Валидация логина
         if not self._validate_username(username):
             validation_messages = self.messages["username_validation"]
@@ -92,6 +87,8 @@ class RegistrationHandlers(BaseHandler):
         trial_days = self.config.NEW_USER_SETTINGS.get('trial_days', 3)
         protocols = self.config.NEW_USER_SETTINGS.get('default_protocols', ['vless'])
         data_limit = self.config.NEW_USER_SETTINGS.get('data_limit_gb')
+        
+        # ИСПРАВЛЕНО: Улучшена обработка ошибок
         success, error_text = self.marzban.create_new_user(
             username=username,
             protocols=protocols,
@@ -100,6 +97,7 @@ class RegistrationHandlers(BaseHandler):
         )
         if not success:
             error_message = creation_messages["error"]
+            # Показываем пользователю детальную причину ошибки, если она есть
             if error_text:
                 error_message += f"\n\nПричина: {error_text}"
             await update.message.reply_text(error_message)
